@@ -9,7 +9,7 @@
 
 # %%
 # Install dependencies (run this cell first in Colab)
-!pip install -q torch torchvision matplotlib opencv-python-headless scikit-image scikit-learn pywt Pillow tqdm
+# !pip install -q torch torchvision matplotlib opencv-python-headless scikit-image scikit-learn pywt Pillow tqdm
 
 # Note: opencv-python-headless includes SIFT in many builds. If your CV2 lacks SIFT,
 # use `opencv-contrib-python` instead. In that case replace the install line above.
@@ -23,6 +23,8 @@ import pywt
 from scipy.fftpack import dct, idct
 import hashlib
 import hmac
+import math
+import warnings
 import matplotlib.pyplot as plt
 from skimage import data, img_as_float, io, color
 from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim
@@ -198,10 +200,20 @@ def embed_digest_in_image(rgb_img, digest_bits, N_patches=8, patch_size=64, alph
     # rgb_img: uint8 RGB
     kp_list = get_sift_keypoints(rgb_img, max_kp=N_patches*4)
     chosen = kp_list[:N_patches]
+    if len(chosen) == 0:
+        raise ValueError("No SIFT keypoints available for embedding. Try increasing image texture or patch count.")
     Y = to_y_channel(rgb_img)  # float [0,1]
     Y_out = Y.copy()
     embed_locations = []
-    bits_per_patch = len(digest_bits) // N_patches
+    total_bits = max(1, len(digest_bits))
+    actual_patches = len(chosen)
+    max_bits_per_patch = max(1, patch_size // 2)
+    capacity = actual_patches * max_bits_per_patch
+    if capacity < total_bits:
+        raise ValueError(f"Insufficient embedding capacity: need {total_bits} bits but only {capacity} bits available. Increase patch count or reduce payload.")
+    bits_per_patch = max(1, math.ceil(total_bits / actual_patches))
+    bits_per_patch = min(bits_per_patch, max_bits_per_patch)
+    padded_bits = digest_bits.ljust(bits_per_patch * actual_patches, '0')
 
     for i,kp in enumerate(chosen):
         patch, (x1,y1,x2,y2) = extract_patch(cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR), kp, patch_size)
@@ -213,7 +225,7 @@ def embed_digest_in_image(rgb_img, digest_bits, N_patches=8, patch_size=64, alph
         # We'll embed into LL's DCT by block-dct full patch
         dct_LL = block_dct(LL)
         start = i*bits_per_patch
-        bits = digest_bits[start:start+bits_per_patch]
+        bits = padded_bits[start:start+bits_per_patch]
         # apply SVD modification on dct_LL
         dct_mod = svd_modify_and_reconstruct(dct_LL, bits, alpha=alpha)
         LL_mod = block_idct(dct_mod)
@@ -229,7 +241,7 @@ def embed_digest_in_image(rgb_img, digest_bits, N_patches=8, patch_size=64, alph
     ycbcr = cv2.cvtColor(img, cv2.COLOR_RGB2YCrCb).astype(np.float32)
     ycbcr[:,:,0] = np.clip(Y_out*255.0, 0, 255)
     out_rgb = cv2.cvtColor(ycbcr.astype(np.uint8), cv2.COLOR_YCrCb2RGB)
-    return out_rgb, embed_locations
+    return out_rgb, embed_locations, bits_per_patch
 
 # %%
 # Extraction routine from patches
@@ -279,6 +291,24 @@ def attack_rotate(img, angle=10):
     h,w = img.shape[:2]
     M = cv2.getRotationMatrix2D((w/2,h/2), angle, 1.0)
     return cv2.warpAffine(img, M, (w,h), borderMode=cv2.BORDER_REFLECT)
+
+
+def attack_crop(img, crop_ratio=0.85):
+    h, w = img.shape[:2]
+    ch = max(1, int(h * crop_ratio))
+    cw = max(1, int(w * crop_ratio))
+    y1 = max(0, (h - ch) // 2)
+    x1 = max(0, (w - cw) // 2)
+    cropped = img[y1:y1+ch, x1:x1+cw]
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def attack_combined_heavy(img):
+    out = attack_rotate(img, angle=20)
+    out = attack_crop(out, crop_ratio=0.85)
+    out = attack_jpeg(out, quality=40)
+    out = attack_blur(out, ksize=5)
+    return out
 
 # compound
 
@@ -358,7 +388,7 @@ digest = compute_hmac_digest(feat, key=b'my_secret_key', digest_bits=128)
 print('Digest bits length:', len(digest))
 
 # embed
-watermarked, locs = embed_digest_in_image(img_uint8, digest, N_patches=8, patch_size=64, alpha=0.02)
+watermarked, locs, bits_per_patch = embed_digest_in_image(img_uint8, digest, N_patches=8, patch_size=64, alpha=0.02)
 
 # attack benign
 attacked_benign = compound_benign(watermarked)
@@ -366,8 +396,8 @@ attacked_benign = compound_benign(watermarked)
 attacked_malicious = malicious_splice(watermarked, donor_uint8)
 
 # verify
-res_benign = verify_semi_fragile(attacked_benign, img_uint8, key=b'my_secret_key')
-res_mal = verify_semi_fragile(attacked_malicious, img_uint8, key=b'my_secret_key')
+res_benign = verify_semi_fragile(attacked_benign, img_uint8, key=b'my_secret_key', bits_per_patch=bits_per_patch)
+res_mal = verify_semi_fragile(attacked_malicious, img_uint8, key=b'my_secret_key', bits_per_patch=bits_per_patch)
 print('Benign result:', res_benign[0], 'hamming to orig,rec:', res_benign[1], res_benign[2])
 print('Malicious result:', res_mal[0], 'hamming to orig,rec:', res_mal[1], res_mal[2])
 
@@ -386,19 +416,37 @@ def evaluate_on_dataset(images, donor_images, key=b'my_secret_key'):
         img_uint8 = (img*255).astype(np.uint8)
         feat = extract_vgg_descriptor(img_uint8)
         digest = compute_hmac_digest(feat, key=key, digest_bits=128)
-        watermarked, _ = embed_digest_in_image(img_uint8, digest, N_patches=8)
+        watermarked, locs, bits_per_patch, enc_bits, nsym_used = embed_digest_with_rs(img_uint8, digest, nsym=32)
         # benign
         attacked = compound_benign(watermarked)
-        res,_,_,_,_,_ = verify_semi_fragile(attacked, img_uint8, key=key)
+        benign_res = combined_verification_pipeline(
+            attacked,
+            img_uint8,
+            key=key,
+            orig_nbits=128,
+            nsym=nsym_used,
+            N_patches=len(locs),
+            bits_per_patch=bits_per_patch,
+            encoded_bits_len=len(enc_bits)
+        )
         stats['benign_total'] += 1
-        if res == 'PASS':
+        if benign_res['fused_decision'] in {'PASS', 'PASS_NO_OWNERSHIP', 'POSSIBLE_PASS'}:
             stats['benign_pass'] += 1
         # malicious
         donor = donor_images[i % len(donor_images)]
         mal = malicious_splice(watermarked, (donor*255).astype(np.uint8))
-        res_m,_,_,_,_,_ = verify_semi_fragile(mal, img_uint8, key=key)
+        mal_res = combined_verification_pipeline(
+            mal,
+            img_uint8,
+            key=key,
+            orig_nbits=128,
+            nsym=nsym_used,
+            N_patches=len(locs),
+            bits_per_patch=bits_per_patch,
+            encoded_bits_len=len(enc_bits)
+        )
         stats['mal_total'] += 1
-        if res_m == 'TAMPER':
+        if mal_res['fused_decision'] in {'TAMPER', 'DISPUTED', 'FLAG_FOR_REVIEW'}:
             stats['mal_pass'] += 1
     return stats
 
@@ -447,26 +495,40 @@ class SimpleImageFolder(Dataset):
         img = io.imread(p)
         if img.ndim==2:
             img = np.stack([img,img,img],axis=-1)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = (img/255.0).astype(np.float32)
-        img = torch.from_numpy(img).permute(2,0,1)
-        img = F.interpolate(img.unsqueeze(0), size=(256,256), mode='bilinear', align_corners=False).squeeze(0)
-        return img
+        img = img.astype(np.float32)
+        if img.max() > 1.0:
+            img = img / 255.0
+        img_t = torch.from_numpy(img).permute(2,0,1)
+        img_t = F.interpolate(img_t.unsqueeze(0), size=(256,256), mode='bilinear', align_corners=False).squeeze(0)
+        return img_t
 
 # %%
 # Small U-Net style encoder (produces residual) and decoder
 class Encoder(nn.Module):
-    def __init__(self, in_channels=3, hidden=64):
+    def __init__(self, in_channels=3, hidden=64, payload_len=64):
         super().__init__()
-        self.down1 = nn.Sequential(nn.Conv2d(in_channels, hidden, 3, padding=1), nn.ReLU(),
+        self.hidden = hidden
+        self.payload_len = payload_len
+        self.payload_embed = nn.Sequential(
+            nn.Linear(payload_len, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU()
+        )
+        self.down1 = nn.Sequential(nn.Conv2d(in_channels + hidden, hidden, 3, padding=1), nn.ReLU(),
                                    nn.Conv2d(hidden, hidden, 3, padding=1), nn.ReLU())
         self.pool = nn.MaxPool2d(2)
         self.down2 = nn.Sequential(nn.Conv2d(hidden, hidden*2, 3, padding=1), nn.ReLU(),
                                    nn.Conv2d(hidden*2, hidden*2, 3, padding=1), nn.ReLU())
         self.up1 = nn.Sequential(nn.ConvTranspose2d(hidden*2, hidden, 2, stride=2), nn.ReLU())
         self.out_conv = nn.Conv2d(hidden, in_channels, 1)
-    def forward(self, x):
-        d1 = self.down1(x)
+    def forward(self, x, payload_bits):
+        if payload_bits is None:
+            payload_bits = torch.zeros(x.size(0), self.payload_len, device=x.device, dtype=x.dtype)
+        payload_feat = self.payload_embed(payload_bits)
+        payload_feat = payload_feat.view(payload_feat.size(0), self.hidden, 1, 1).expand(-1, -1, x.size(2), x.size(3))
+        x_in = torch.cat([x, payload_feat], dim=1)
+        d1 = self.down1(x_in)
         p = self.pool(d1)
         d2 = self.down2(p)
         u = self.up1(d2)
@@ -540,18 +602,16 @@ class DifferentiableAttack(nn.Module):
             x = torch.clamp(x + noise, 0, 1)
         # non-diff JPEG: apply with probability p_jpeg using PIL round-trip on CPU
         if random.random() < self.p_jpeg:
-            x_cpu = (x.detach().cpu().numpy()*255).astype(np.uint8)
-            B,H,W,_ = x_cpu.shape[0], x_cpu.shape[2], x_cpu.shape[3], x_cpu.shape[1]
+            x_cpu = (x.detach().cpu().clamp(0,1).permute(0,2,3,1).numpy()*255).astype(np.uint8)
             out_cpu = []
             for i in range(x_cpu.shape[0]):
-                pil = cv2.cvtColor((x_cpu[i].transpose(1,2,0)), cv2.COLOR_RGB2BGR)
-                # encode/decode jpeg
+                bgr = cv2.cvtColor(x_cpu[i], cv2.COLOR_RGB2BGR)
                 q = random.randint(60,95)
-                is_success, enc = cv2.imencode('.jpg', pil, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+                _, enc = cv2.imencode('.jpg', bgr, [int(cv2.IMWRITE_JPEG_QUALITY), q])
                 dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
                 dec_rgb = cv2.cvtColor(dec, cv2.COLOR_BGR2RGB)
                 out_cpu.append(dec_rgb.astype(np.float32)/255.0)
-            x = torch.from_numpy(np.stack(out_cpu, axis=0)).permute(0,3,1,2).to(x.device).float()
+            x = torch.from_numpy(np.stack(out_cpu, axis=0)).permute(0,3,1,2).to(x.device)
         return x
 
 # %%
@@ -580,7 +640,7 @@ def perceptual_loss(x, y):
 def train_residual_encoder(root_images='./images_train', epochs=10, batch_size=8, payload_len=64, lr=1e-4, save_every=1):
     dataset = SimpleImageFolder(root_images)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    enc = Encoder().to(device)
+    enc = Encoder(payload_len=payload_len).to(device)
     dec = Decoder(payload_len=payload_len).to(device)
     attack = DifferentiableAttack().to(device)
     optim = torch.optim.Adam(list(enc.parameters())+list(dec.parameters()), lr=lr)
@@ -593,19 +653,8 @@ def train_residual_encoder(root_images='./images_train', epochs=10, batch_size=8
             imgs = imgs.to(device).float()
             B = imgs.size(0)
             # random payload per image
-            payload = torch.randint(0,2,(B,payload_len)).float().to(device)
-            # map payload bits to a noise map (simple injection) - expand to spatial
-            payload_map = payload.unsqueeze(-1).unsqueeze(-1)
-            payload_map = payload_map.repeat(1,1,imgs.size(2),imgs.size(3))
-            # Encoder: produce residual using cover+payload_map concat
-            # For simplicity, we concatenate payload as extra channels: average pooling to reduce channels
-            # Here we'll tile a compressed payload (first channel) to concat
-            pchan = payload.float().unsqueeze(2).unsqueeze(3)
-            pchan = pchan.repeat(1,1,imgs.size(2),imgs.size(3))
-            # reduce pchan to 1 channel by XOR-ish map (sum mod 1)
-            p_comb = (pchan.sum(dim=1, keepdim=True) % 1.0)
-            enc_in = imgs
-            residual = enc(enc_in)
+            payload = torch.randint(0,2,(B,payload_len), device=device).float()
+            residual = enc(imgs, payload)
             watermarked = torch.clamp(imgs + residual, 0.0, 1.0)
             # Attack
             attacked = attack(watermarked)
@@ -633,7 +682,7 @@ def train_residual_encoder(root_images='./images_train', epochs=10, batch_size=8
 # -------------------------------------------------
 # Original Notes & next steps:
 # - This training loop is a starting point. Improvements:
-#   * Proper payload embedding mechanism (instead of ad-hoc tiled payload_map) — encode payload into a small learned embedding and concatenate.
+#   * Proper payload embedding mechanism (instead of ad-hoc tiled payload_map) ? encode payload into a small learned embedding and concatenate.
 #   * Use Reed-Solomon / BCH coding on payload and add ECC loss for decoder to predict soft bits.
 #   * Better data augmentation and curriculum: start with mild attacks, then increase severity.
 #   * Add validation set and compute BER during training.
@@ -644,11 +693,11 @@ def train_residual_encoder(root_images='./images_train', epochs=10, batch_size=8
 #   3) produce a downloadable .ipynb containing the full notebook ready to run on Colab.
 
 # === ERROR CORRECTION, PER-PATCH VOTING & SIGNAL FUSION ===
-# Add Reed–Solomon ECC around payload, per-patch weighted voting, and combined fragile+robust verification.
+# Add Reed?Solomon ECC around payload, per-patch weighted voting, and combined fragile+robust verification.
 
 # %%
 # Install Reed-Solomon (run in Colab)
-!pip install -q reedsolo
+# !pip install -q reedsolo
 
 # %%
 import reedsolo
@@ -700,9 +749,36 @@ def rs_decode_bits(encoded_bitstr: str, orig_nbits: int, nsym: int=32):
 # %%
 # Update embedding routine to accept ECC encoded digest
 
-def embed_digest_with_rs(rgb_img, digest_bits, nsym=32, **kwargs):
-    enc_bits = rs_encode_bits(digest_bits, nsym=nsym)
-    return embed_digest_in_image(rgb_img, enc_bits, **kwargs), enc_bits
+def embed_digest_with_rs(rgb_img, digest_bits, nsym=32, patch_size=64, min_patches=8, **kwargs):
+    current_nsym = nsym
+    last_error = None
+    while current_nsym >= 1:
+        enc_bits = rs_encode_bits(digest_bits, nsym=current_nsym)
+        max_bits_per_patch = max(1, patch_size // 2)
+        required_patches = math.ceil(len(enc_bits) / max_bits_per_patch)
+        desired_patches = max(min_patches, required_patches)
+        kwargs_local = dict(kwargs)
+        N_patches = max(kwargs_local.pop('N_patches', desired_patches), desired_patches)
+        try:
+            wm_img, locations, bits_per_patch = embed_digest_in_image(
+                rgb_img,
+                enc_bits,
+                N_patches=N_patches,
+                patch_size=patch_size,
+                **kwargs_local
+            )
+            return wm_img, locations, bits_per_patch, enc_bits, current_nsym
+        except ValueError as e:
+            last_error = e
+            if current_nsym <= 4:
+                break
+            reduced_nsym = max(4, current_nsym // 2)
+            warnings.warn(
+                f"Embedding capacity limited; reducing Reed-Solomon parity bytes from {current_nsym} to {reduced_nsym}.",
+                RuntimeWarning
+            )
+            current_nsym = reduced_nsym
+    raise ValueError(f"Failed to embed ECC-protected watermark: {last_error}")
 
 # %%
 # Per-patch extraction that returns confidence as well
@@ -712,6 +788,7 @@ def extract_digest_with_confidence(rgb_img, N_patches=8, patch_size=64, bits_per
     chosen = kp_list[:N_patches]
     extracted_bits = []
     confidences = []
+    boxes = []
     for i,kp in enumerate(chosen):
         patch, (x1,y1,x2,y2) = extract_patch(cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR), kp, patch_size)
         Yp = to_y_channel(cv2.cvtColor(patch, cv2.COLOR_BGR2RGB))
@@ -729,7 +806,8 @@ def extract_digest_with_confidence(rgb_img, N_patches=8, patch_size=64, bits_per
         # invert so larger conf means more reliable (we may want smaller top_mean -> more stable)
         confidences.append(float(conf))
         extracted_bits.append(patch_bits)
-    return extracted_bits, confidences
+        boxes.append((x1,y1,x2,y2))
+    return extracted_bits, confidences, boxes
 
 # %%
 # Weighted majority voting across patches
@@ -759,11 +837,13 @@ def weighted_majority_aggregate(extracted_bits_list, confidences, expected_len=N
 # %%
 # RS-aware extraction wrapper: aggregate patches -> RS decode -> return decoded bits and status
 
-def extract_and_decode_rs(rgb_img, orig_nbits=128, N_patches=8, bits_per_patch=16, nsym=32):
-    extracted_list, confs = extract_digest_with_confidence(rgb_img, N_patches=N_patches, patch_size=64, bits_per_patch=bits_per_patch)
-    agg_bits, avg_conf = weighted_majority_aggregate(extracted_list, confs, expected_len=orig_nbits+nsym*8)
-    decoded, ok, info = rs_decode_bits(agg_bits, orig_nbits, nsym=nsym)
-    return decoded, ok, info, avg_conf
+def extract_and_decode_rs(rgb_img, orig_nbits=128, N_patches=8, bits_per_patch=16, nsym=32, encoded_bits_len=None):
+    extracted_list, confs, boxes = extract_digest_with_confidence(rgb_img, N_patches=N_patches, patch_size=64, bits_per_patch=bits_per_patch)
+    expected_len = encoded_bits_len if encoded_bits_len is not None else orig_nbits + nsym*8
+    agg_bits, avg_conf = weighted_majority_aggregate(extracted_list, confs, expected_len=expected_len)
+    trimmed_bits = agg_bits[:expected_len]
+    decoded, ok, info = rs_decode_bits(trimmed_bits, orig_nbits, nsym=nsym)
+    return decoded, ok, info, avg_conf, boxes, confs
 
 # %%
 # Combine fragile (semi-fragile digest) and robust (ownership watermark) signals
@@ -814,9 +894,10 @@ def fuse_decisions(fr_result, fr_conf, robust_ok, robust_conf, thresholds=dict(p
 # Example combined verification function using the new ECC + voting + fusion
 
 def combined_verification_pipeline(received_rgb, original_rgb, key=b'my_secret_key',
-                                   orig_nbits=128, nsym=32, N_patches=8, bits_per_patch=16):
+                                   orig_nbits=128, nsym=32, N_patches=8, bits_per_patch=16,
+                                   encoded_bits_len=None):
     # Semi-fragile (fragile) path: extract + RS decode
-    decoded, ok, info, avg_conf = extract_and_decode_rs(received_rgb, orig_nbits=orig_nbits, N_patches=N_patches, bits_per_patch=bits_per_patch, nsym=nsym)
+    decoded, ok, info, avg_conf, patch_boxes, patch_confidences = extract_and_decode_rs(received_rgb, orig_nbits=orig_nbits, N_patches=N_patches, bits_per_patch=bits_per_patch, nsym=nsym, encoded_bits_len=encoded_bits_len)
     # compute recomputed digest (owner side)
     orig_feat = extract_vgg_descriptor(original_rgb)
     orig_digest = compute_hmac_digest(orig_feat, key=key, digest_bits=orig_nbits)
@@ -845,7 +926,74 @@ def combined_verification_pipeline(received_rgb, original_rgb, key=b'my_secret_k
         'robust_ok': robust_ok,
         'robust_confidence': robust_conf,
         'fused_decision': fused,
-        'rs_info': info
+        'rs_info': info,
+        'patch_boxes': patch_boxes,
+        'patch_confidences': patch_confidences
+    }
+
+# %%
+# Tamper localization utilities
+
+def compute_structural_heatmap(original_rgb, suspect_rgb, window_size=21, sigma=1.5):
+    """Return normalized SSIM-based discrepancy map and similarity score."""
+    orig_gray = color.rgb2gray(original_rgb)
+    suspect_gray = color.rgb2gray(suspect_rgb)
+    score, diff = ssim(
+        orig_gray,
+        suspect_gray,
+        win_size=window_size,
+        gaussian_weights=True,
+        sigma=sigma,
+        use_sample_covariance=False,
+        full=True
+    )
+    heatmap = 1.0 - diff
+    heatmap = np.clip(heatmap, 0.0, 1.0)
+    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+    return heatmap, score
+
+
+def build_patch_confidence_map(image_shape, patch_boxes, patch_confidences):
+    h, w = image_shape[:2]
+    accumulator = np.zeros((h, w), dtype=np.float32)
+    counts = np.zeros((h, w), dtype=np.float32)
+    for (x1, y1, x2, y2), conf in zip(patch_boxes, patch_confidences):
+        accumulator[y1:y2, x1:x2] += conf
+        counts[y1:y2, x1:x2] += 1.0
+    mask = counts > 0
+    accumulator[mask] /= counts[mask]
+    return accumulator
+
+
+def fuse_heatmaps(structural_heatmap, patch_heatmap, weight_structural=0.7):
+    patch_rescaled = (patch_heatmap - patch_heatmap.min()) / (patch_heatmap.max() - patch_heatmap.min() + 1e-8)
+    fused = np.clip(weight_structural * structural_heatmap + (1 - weight_structural) * patch_rescaled, 0.0, 1.0)
+    return fused
+
+
+def overlay_heatmap(rgb_img, heatmap, cmap='inferno', alpha=0.6):
+    import matplotlib.cm as cm
+    rgb_norm = rgb_img.astype(np.float32) / 255.0
+    colormap = cm.get_cmap(cmap)(heatmap)[..., :3]
+    overlay = np.clip(alpha * colormap + (1 - alpha) * rgb_norm, 0.0, 1.0)
+    return overlay
+
+
+def render_tamper_visualization(original_rgb, suspect_rgb, pipeline_result):
+    structural_heatmap, ssim_score = compute_structural_heatmap(original_rgb, suspect_rgb)
+    patch_boxes = pipeline_result.get('patch_boxes') or []
+    patch_confidences = pipeline_result.get('patch_confidences') or []
+    if len(patch_boxes) == 0 or len(patch_confidences) == 0:
+        fused_heatmap = structural_heatmap
+    else:
+        patch_map = build_patch_confidence_map(original_rgb.shape, patch_boxes, patch_confidences)
+        fused_heatmap = fuse_heatmaps(structural_heatmap, patch_map)
+    overlay = overlay_heatmap(suspect_rgb, fused_heatmap)
+    return {
+        'structural_heatmap': structural_heatmap,
+        'fused_heatmap': fused_heatmap,
+        'overlay': overlay,
+        'ssim_score': ssim_score
     }
 
 # %%
@@ -880,7 +1028,7 @@ def create_subsets(root_dir, train_n=10000, val_n=2000, test_n=2000, seed=42):
     random.Random(seed).shuffle(paths)
     total_needed = train_n + val_n + test_n
     if len(paths) < total_needed:
-        raise ValueError(f"Not enough images in {root_dir} — found {len(paths)}, need {total_needed}")
+        raise ValueError(f"Not enough images in {root_dir} ? found {len(paths)}, need {total_needed}")
     train_paths = paths[:train_n]
     val_paths = paths[train_n:train_n+val_n]
     test_paths = paths[train_n+val_n:train_n+val_n+test_n]
@@ -897,8 +1045,9 @@ class SubsetImageDataset(Dataset):
         img = io.imread(p)
         if img.ndim==2:
             img = np.stack([img,img,img],axis=-1)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = (img/255.0).astype(np.float32)
+        img = img.astype(np.float32)
+        if img.max() > 1.0:
+            img = img / 255.0
         # center crop or resize to square
         H,W = img.shape[:2]
         side = min(H,W)
@@ -918,16 +1067,51 @@ class HybridSystem:
         self.digest_bits = digest_bits
         self.key = key
         self.nsym = nsym
-    def embed_classical_batch(self, imgs_np_batch):
+        self.last_metadata = []
+    def embed_classical_batch(self, imgs_np_batch, return_metadata=False):
         # imgs_np_batch: [B,H,W,3] uint8
         out_list = []
+        metadata = []
         for img_np in imgs_np_batch:
             feat = extract_vgg_descriptor(img_np)
             digest = compute_hmac_digest(feat, key=self.key, digest_bits=self.digest_bits)
-            enc_bits = rs_encode_bits(digest, nsym=self.nsym)
-            wm, _ = embed_digest_in_image(img_np, enc_bits, N_patches=8)
-            out_list.append(wm)
-        return np.stack(out_list, axis=0)
+            try:
+                wm, locations, bits_per_patch, enc_bits, nsym_used = embed_digest_with_rs(
+                    img_np,
+                    digest_bits=digest,
+                    nsym=self.nsym,
+                    patch_size=64,
+                    min_patches=8
+                )
+                metadata.append({
+                    'digest': digest,
+                    'encoded_bits': enc_bits,
+                    'encoded_len_bits': len(enc_bits),
+                    'bits_per_patch': bits_per_patch,
+                    'locations': locations,
+                    'N_patches': len(locations),
+                    'nsym_used': nsym_used,
+                    'fallback': False
+                })
+                out_list.append(wm)
+            except ValueError as e:
+                warnings.warn(f"Classical embedding fallback due to: {e}", RuntimeWarning)
+                metadata.append({
+                    'digest': digest,
+                    'encoded_bits': '',
+                    'encoded_len_bits': 0,
+                    'bits_per_patch': 0,
+                    'locations': [],
+                    'N_patches': 0,
+                    'nsym_used': 0,
+                    'fallback': True
+                })
+                out_list.append(img_np)
+        self.last_metadata = metadata
+        wm_array = np.stack(out_list, axis=0)
+        if return_metadata:
+            return wm_array, metadata
+        return wm_array
 
 # %%
 # Training + evaluation functions
@@ -946,7 +1130,7 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
 
     print('Train samples:', len(train_ds), 'Val:', len(val_ds), 'Test:', len(test_ds))
 
-    enc = Encoder().to(device)
+    enc = Encoder(payload_len=payload_len).to(device)
     dec = Decoder(payload_len=payload_len).to(device)
     attack = DifferentiableAttack().to(device)
     hybrid = HybridSystem(enc, dec, use_classical_embed=True)
@@ -972,14 +1156,13 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
             classical_wm_np = hybrid.embed_classical_batch(imgs_np)
             classical_wm_t = torch.from_numpy(classical_wm_np.astype(np.float32)/255.0).permute(0,3,1,2).to(device)
 
-            # Learned residual on top
-            residual = enc(classical_wm_t)
+            # Learned residual on top conditioned on payload
+            payload = torch.randint(0,2,(B,payload_len), device=device).float()
+            residual = enc(classical_wm_t, payload)
             watermarked = torch.clamp(classical_wm_t + residual, 0.0, 1.0)
 
             attacked = attack(watermarked)
             logits = dec(attacked)
-            # generate random payload per sample
-            payload = torch.randint(0,2,(B,payload_len)).float().to(device)
             bce = F.binary_cross_entropy_with_logits(logits, payload)
             mse = F.mse_loss(watermarked, classical_wm_t)
             perc = perceptual_loss(watermarked, classical_wm_t)
@@ -1010,11 +1193,11 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
                 imgs_np = (imgs.permute(0,2,3,1).cpu().numpy()*255.0).astype(np.uint8)
                 classical_wm_np = hybrid.embed_classical_batch(imgs_np)
                 classical_wm_t = torch.from_numpy(classical_wm_np.astype(np.float32)/255.0).permute(0,3,1,2).to(device)
-                residual = enc(classical_wm_t)
+                payload = torch.randint(0,2,(B,payload_len), device=device).float()
+                residual = enc(classical_wm_t, payload)
                 watermarked = torch.clamp(classical_wm_t + residual, 0.0, 1.0)
                 attacked = attack(watermarked)
                 logits = dec(attacked)
-                payload = torch.randint(0,2,(B,payload_len)).float().to(device)
                 bce = F.binary_cross_entropy_with_logits(logits, payload)
                 val_losses.append(bce.item())
                 preds = (torch.sigmoid(logits) > 0.5).long().cpu().numpy().reshape(-1)
@@ -1055,7 +1238,7 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
 
     # After training: evaluate on test set with attack suite
     print('Running final test-suite evaluation...')
-    test_metrics = evaluate_test_suite(test_loader, hybrid, enc, dec, attack, device)
+    test_metrics = evaluate_test_suite(test_loader, hybrid, enc, dec, attack, device, payload_len=payload_len)
 
     # Plot training curves
     plt.figure(figsize=(10,4))
@@ -1076,15 +1259,16 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
 # %%
 # Test-suite evaluation: multiple attacks -> compute BER, PSNR, SSIM, detection metrics
 
-def evaluate_test_suite(test_loader, hybrid, enc, dec, attack_model, device):
+def evaluate_test_suite(test_loader, hybrid, enc, dec, attack_model, device, payload_len=64):
     enc.eval(); dec.eval()
-    results = []
     attacks = {
         'benign': lambda x: compound_benign(x),
         'jpeg_q50': lambda x: attack_jpeg(x, quality=50),
         'resize_0.7': lambda x: attack_resize(x, scale=0.7),
         'blur_k5': lambda x: attack_blur(x, ksize=5),
-        'rotate_15': lambda x: attack_rotate(x, angle=15)
+        'rotate_15': lambda x: attack_rotate(x, angle=15),
+        'crop_0.85': lambda x: attack_crop(x, crop_ratio=0.85),
+        'combined_heavy': lambda x: attack_combined_heavy(x)
     }
     all_summary = {}
     with torch.no_grad():
@@ -1093,13 +1277,18 @@ def evaluate_test_suite(test_loader, hybrid, enc, dec, attack_model, device):
             psnr_list = []
             ssim_list = []
             bit_accs = []
+            det_truths = []
+            det_preds = []
+            det_scores = []
             for imgs in tqdm(test_loader, desc=f'Test {atk_name}'):
                 imgs = imgs.to(device)
                 B = imgs.size(0)
                 imgs_np = (imgs.permute(0,2,3,1).cpu().numpy()*255.0).astype(np.uint8)
                 classical_wm_np = hybrid.embed_classical_batch(imgs_np)
+                meta_batch = hybrid.last_metadata
                 classical_wm_t = torch.from_numpy(classical_wm_np.astype(np.float32)/255.0).permute(0,3,1,2).to(device)
-                residual = enc(classical_wm_t)
+                payload = torch.randint(0,2,(B,payload_len), device=device).float()
+                residual = enc(classical_wm_t, payload)
                 watermarked = torch.clamp(classical_wm_t + residual, 0.0, 1.0)
 
                 # apply attack in numpy domain for classical sim
@@ -1108,7 +1297,6 @@ def evaluate_test_suite(test_loader, hybrid, enc, dec, attack_model, device):
                 attacked_t = torch.from_numpy(attacked_np.astype(np.float32)/255.0).permute(0,3,1,2).to(device)
 
                 logits = dec(attacked_t)
-                payload = torch.randint(0,2,(B,dec.fc[-1].out_features if hasattr(dec.fc[-1],'out_features') else payload_len)).float().to(device)
                 preds = (torch.sigmoid(logits) > 0.5).long().cpu().numpy().reshape(-1)
                 targs = payload.long().cpu().numpy().reshape(-1)
                 # BER
@@ -1120,18 +1308,153 @@ def evaluate_test_suite(test_loader, hybrid, enc, dec, attack_model, device):
                     at = attacked_np[i]
                     psnr_list.append(psnr(wm, at))
                     try:
-                        ssim_list.append(ssim(wm, at, multichannel=True))
+                        ssim_list.append(ssim(wm, at, channel_axis=-1))
                     except Exception:
                         ssim_list.append(0.0)
+                    meta = meta_batch[i]
+                    n_patch_used = max(1, len(meta.get('locations', [])))
+                    if meta.get('fallback') or meta.get('bits_per_patch', 0) <= 0 or meta.get('encoded_len_bits', 0) <= 0:
+                        continue
+                    pipeline_res = combined_verification_pipeline(
+                        at,
+                        imgs_np[i],
+                        key=hybrid.key,
+                        orig_nbits=hybrid.digest_bits,
+                        nsym=meta.get('nsym_used', hybrid.nsym),
+                        N_patches=meta.get('N_patches', n_patch_used),
+                        bits_per_patch=meta.get('bits_per_patch', 16),
+                        encoded_bits_len=meta.get('encoded_len_bits')
+                    )
+                    fused = pipeline_res['fused_decision']
+                    is_tampered = 0 if atk_name == 'benign' else 1
+                    tamper_states = {'TAMPER', 'DISPUTED', 'FLAG_FOR_REVIEW'}
+                    pred_tamper = 1 if fused in tamper_states else 0
+                    if fused in {'PASS', 'PASS_NO_OWNERSHIP'}:
+                        tamper_score = 0.0
+                    elif fused == 'POSSIBLE_PASS':
+                        tamper_score = 0.35
+                    elif fused == 'UNCERTAIN':
+                        tamper_score = 0.6 if is_tampered else 0.4
+                    else:
+                        tamper_score = 1.0
+                    det_truths.append(is_tampered)
+                    det_preds.append(pred_tamper)
+                    det_scores.append(tamper_score)
                 ber_list.append(ber)
 
+            if det_truths:
+                det_precision = precision_score(det_truths, det_preds, zero_division=0)
+                det_recall = recall_score(det_truths, det_preds, zero_division=0)
+                det_f1 = f1_score(det_truths, det_preds, zero_division=0)
+                try:
+                    det_auc = roc_auc_score(det_truths, det_scores)
+                except Exception:
+                    det_auc = 0.5
+            else:
+                det_precision = det_recall = det_f1 = 0.0
+                det_auc = 0.5
             all_summary[atk_name] = {
-                'mean_bit_acc': float(np.mean(bit_accs)),
-                'mean_psnr': float(np.mean(psnr_list)),
-                'mean_ssim': float(np.mean(ssim_list)),
+                'mean_bit_acc': float(np.mean(bit_accs)) if bit_accs else 0.0,
+                'mean_psnr': float(np.mean(psnr_list)) if psnr_list else 0.0,
+                'mean_ssim': float(np.mean(ssim_list)) if ssim_list else 0.0,
+                'tamper_precision': float(det_precision),
+                'tamper_recall': float(det_recall),
+                'tamper_f1': float(det_f1),
+                'tamper_auc': float(det_auc)
             }
-            print(f"Attack {atk_name}: BitAcc: {all_summary[atk_name]['mean_bit_acc']:.3f}, PSNR: {all_summary[atk_name]['mean_psnr']:.2f}, SSIM: {all_summary[atk_name]['mean_ssim']:.3f}")
+            print(f"Attack {atk_name}: BitAcc: {all_summary[atk_name]['mean_bit_acc']:.3f}, PSNR: {all_summary[atk_name]['mean_psnr']:.2f}, SSIM: {all_summary[atk_name]['mean_ssim']:.3f}, TamperF1: {all_summary[atk_name]['tamper_f1']:.3f}")
     return all_summary
+
+
+def metrics_to_dataframe(metrics_summary):
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise ImportError("pandas is required to convert metrics to a DataFrame. Install it with `pip install pandas`." ) from exc
+    rows = []
+    for attack_name, metrics in metrics_summary.items():
+        row = {'attack': attack_name}
+        row.update(metrics)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def export_metrics_csv(metrics_summary, csv_path):
+    df = metrics_to_dataframe(metrics_summary)
+    df.to_csv(csv_path, index=False)
+    return csv_path
+
+
+def launch_streamlit_demo(device=device):
+    try:
+        import streamlit as st
+    except ImportError as exc:
+        raise ImportError("Streamlit is required for the interactive demo. Install it with `pip install streamlit`." ) from exc
+
+    st.set_page_config(page_title="Semi-Fragile Watermark Demo", layout="wide")
+    st.title("Semi-Fragile & Robust Watermarking Demo")
+    st.write("Upload an original image and optionally a tampered version to evaluate the pipeline.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        original_file = st.file_uploader("Original Image", type=["png", "jpg", "jpeg"], key="original")
+        suspect_file = st.file_uploader("Suspect / Attacked Image", type=["png", "jpg", "jpeg"], key="suspect")
+        attack_choice = st.selectbox("Simulate attack", ["none", "jpeg", "resize", "blur", "rotate", "crop", "combined"], index=0)
+        alpha = st.slider("Residual strength (alpha)", 0.01, 0.05, 0.02, 0.005)
+
+    if original_file is None:
+        st.info("Please upload an original image to begin.")
+        return
+
+    original = io.imread(original_file)
+    if original.ndim == 2:
+        original = np.stack([original]*3, axis=-1)
+    original_uint8 = (original.astype(np.float32) / original.max() * 255.0).astype(np.uint8) if original.max() <= 1.0 else original.astype(np.uint8)
+
+    feat = extract_vgg_descriptor(original_uint8)
+    digest = compute_hmac_digest(feat)
+    watermarked, locs, bits_per_patch, enc_bits, nsym_used = embed_digest_with_rs(original_uint8, digest, alpha=alpha)
+
+    attack_map = {
+        "none": lambda x: x,
+        "jpeg": lambda x: attack_jpeg(x, quality=70),
+        "resize": lambda x: attack_resize(x, scale=0.8),
+        "blur": lambda x: attack_blur(x, ksize=5),
+        "rotate": lambda x: attack_rotate(x, angle=12),
+        "crop": lambda x: attack_crop(x, crop_ratio=0.9),
+        "combined": lambda x: attack_combined_heavy(x)
+    }
+
+    if suspect_file is not None:
+        suspect = io.imread(suspect_file)
+        if suspect.ndim == 2:
+            suspect = np.stack([suspect]*3, axis=-1)
+        suspect_uint8 = (suspect.astype(np.float32) / suspect.max() * 255.0).astype(np.uint8) if suspect.max() <= 1.0 else suspect.astype(np.uint8)
+    else:
+        suspect_uint8 = attack_map[attack_choice](watermarked)
+
+    verification = combined_verification_pipeline(
+        suspect_uint8,
+        original_uint8,
+        nsym=nsym_used,
+        N_patches=len(locs),
+        bits_per_patch=bits_per_patch,
+        encoded_bits_len=len(enc_bits)
+    )
+    viz = render_tamper_visualization(original_uint8, suspect_uint8, verification)
+
+    with col1:
+        st.subheader("Decisions")
+        st.json(verification)
+
+    with col2:
+        st.subheader("Visualization")
+        st.image(original_uint8, caption="Original", use_column_width=True)
+        st.image(watermarked, caption="Watermarked", use_column_width=True)
+        st.image(suspect_uint8, caption="Suspect", use_column_width=True)
+        st.image((viz['overlay']*255).astype(np.uint8), caption="Tamper Heatmap", use_column_width=True)
+
+    st.caption("Decision legend: PASS/POSSIBLE_PASS indicate benign, TAMPER/DISPUTED/FLAG_FOR_REVIEW indicate manipulation.")
 
 # %%
 # How to run (summary):
