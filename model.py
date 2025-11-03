@@ -184,19 +184,38 @@ def get_sift_keypoints(rgb_img, max_kp=64):
 
 
 def extract_patch(img, kp, patch_size=64):
-    x,y = int(kp.pt[0]), int(kp.pt[1])
+    """Return a padded patch plus the valid region coordinates and shape."""
+    x, y = int(round(kp.pt[0])), int(round(kp.pt[1]))
     half = patch_size // 2
-    h,w = img.shape[:2]
-    x1,x2 = max(0,x-half), min(w, x+half)
-    y1,y2 = max(0,y-half), min(h, y+half)
+    h, w = img.shape[:2]
+
+    x1 = max(0, x - half)
+    x2 = min(w, x + half)
+    y1 = max(0, y - half)
+    y2 = min(h, y + half)
+
     patch = img[y1:y2, x1:x2]
-    # if patch smaller than desired, pad
-    if patch.shape[0] != patch_size or patch.shape[1] != patch_size:
-        patch = cv2.copyMakeBorder(patch, 
-                                   top=0, bottom=patch_size-patch.shape[0],
-                                   left=0, right=patch_size-patch.shape[1],
-                                   borderType=cv2.BORDER_REPLICATE)
-    return patch, (x1,y1,x2,y2)
+    valid_h, valid_w = patch.shape[:2]
+
+    if valid_h == 0 or valid_w == 0:
+        # Degenerate keypoint; skip by returning a padded zero patch
+        padded = np.zeros((patch_size, patch_size, img.shape[2] if img.ndim == 3 else 1), dtype=img.dtype)
+        return padded, (x1, y1, x1, y1), (0, 0)
+
+    if valid_h != patch_size or valid_w != patch_size:
+        pad_bottom = patch_size - valid_h
+        pad_right = patch_size - valid_w
+        patch = cv2.copyMakeBorder(
+            patch,
+            top=0,
+            bottom=pad_bottom,
+            left=0,
+            right=pad_right,
+            borderType=cv2.BORDER_REPLICATE
+        )
+
+    bbox = (x1, y1, x1 + valid_w, y1 + valid_h)
+    return patch, bbox, (valid_h, valid_w)
 
 # %%
 # Embedding routine across N SIFT patches
@@ -221,7 +240,9 @@ def embed_digest_in_image(rgb_img, digest_bits, N_patches=8, patch_size=64, alph
     padded_bits = digest_bits.ljust(bits_per_patch * actual_patches, '0')
 
     for i,kp in enumerate(chosen):
-        patch, (x1,y1,x2,y2) = extract_patch(cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR), kp, patch_size)
+        patch, (x1,y1,x2,y2), (valid_h, valid_w) = extract_patch(cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR), kp, patch_size)
+        if valid_h == 0 or valid_w == 0:
+            continue
         # work on Y patch
         patch_rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
         Yp = to_y_channel(patch_rgb)
@@ -237,9 +258,13 @@ def embed_digest_in_image(rgb_img, digest_bits, N_patches=8, patch_size=64, alph
         # inverse DWT
         Yp_mod = idwt2_channel((LL_mod, (LH,HL,HH)))
         # place back Y_out
-        hpatch,wpatch = Yp_mod.shape
-        Y_out[y1:y1+hpatch, x1:x1+wpatch] = Yp_mod
-        embed_locations.append((x1,y1,x1+wpatch,y1+hpatch))
+        hpatch, wpatch = Yp_mod.shape
+        target_h = min(valid_h, hpatch)
+        target_w = min(valid_w, wpatch)
+        if target_h <= 0 or target_w <= 0:
+            continue
+        Y_out[y1:y1+target_h, x1:x1+target_w] = Yp_mod[:target_h, :target_w]
+        embed_locations.append((x1, y1, x1 + target_w, y1 + target_h))
 
     # reconstruct RGB from modified Y and original CbCr
     img = (rgb_img.copy()).astype(np.uint8)
@@ -256,7 +281,7 @@ def extract_digest_from_image(rgb_img, N_patches=8, patch_size=64, bits_per_patc
     chosen = kp_list[:N_patches]
     extracted_bits = []
     for i,kp in enumerate(chosen):
-        patch, (x1,y1,x2,y2) = extract_patch(cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR), kp, patch_size)
+        patch, (_,_,_,_), _ = extract_patch(cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR), kp, patch_size)
         Yp = to_y_channel(cv2.cvtColor(patch, cv2.COLOR_BGR2RGB))
         LL, (LH,HL,HH) = dwt2_channel(Yp)
         dct_LL = block_dct(LL)
@@ -795,7 +820,9 @@ def extract_digest_with_confidence(rgb_img, N_patches=8, patch_size=64, bits_per
     confidences = []
     boxes = []
     for i,kp in enumerate(chosen):
-        patch, (x1,y1,x2,y2) = extract_patch(cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR), kp, patch_size)
+        patch, (x1,y1,x2,y2), (valid_h, valid_w) = extract_patch(cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR), kp, patch_size)
+        if valid_h == 0 or valid_w == 0:
+            continue
         Yp = to_y_channel(cv2.cvtColor(patch, cv2.COLOR_BGR2RGB))
         LL, (LH,HL,HH) = dwt2_channel(Yp)
         dct_LL = block_dct(LL)
@@ -811,7 +838,7 @@ def extract_digest_with_confidence(rgb_img, N_patches=8, patch_size=64, bits_per
         # invert so larger conf means more reliable (we may want smaller top_mean -> more stable)
         confidences.append(float(conf))
         extracted_bits.append(patch_bits)
-        boxes.append((x1,y1,x2,y2))
+        boxes.append((x1, y1, x2, y2))
     return extracted_bits, confidences, boxes
 
 # %%
