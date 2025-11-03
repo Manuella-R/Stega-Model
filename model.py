@@ -1,9 +1,14 @@
 # Semi-fragile Watermarking Colab Notebook
 # -------------------------------------------------
-# This is a Colab-ready Python script (copy cells into a Colab notebook
-# or save as .py and open in Colab). It implements:
-# feature extraction (VGG mid-level) -> HMAC digest -> DWT+DCT+SVD embedding
-# into N SIFT patches -> attack simulator -> extractor + decision logic -> evaluation plots
+# Phase summary:
+#   1. Robust watermark embedding (hybrid DWT/DCT/SVD) - completed and validated.
+#   2. Rotation & cropping immunity via SIFT patch embedding - completed.
+#   3. Semi-fragile VGG->HMAC pipeline with attack simulator - active.
+#   4. Learned encoder/decoder with differentiable attacks - prototype ready.
+#   5. Reed-Solomon ECC + per-patch voting & decision fusion - integrated.
+#   6. Authenticity verification heatmaps & Streamlit demo helpers - provided.
+#   7. Automated benchmarking suite with metrics export - added.
+# Use this .py directly or copy cells into Colab.
 #
 # Requirements (first cell): install packages
 
