@@ -85,6 +85,11 @@ transform = T.Compose([
 ])
 
 from torch import nn
+import torch.nn.utils as nn_utils
+
+DEFAULT_PATCH_SIZE = 80
+DEFAULT_MIN_PATCHES = 20
+DEFAULT_DIGEST_BITS = 128
 
 class VGGHook():
     def __init__(self, model, layer_idx):
@@ -127,7 +132,7 @@ def fit_pca_on_sample_images(sample_images, n_comp=128):
 # %%
 # HMAC digest
 
-def compute_hmac_digest(feature_vec, key=b'secret_key', digest_bits=128):
+def compute_hmac_digest(feature_vec, key=b'secret_key', digest_bits=DEFAULT_DIGEST_BITS):
     # feature_vec: 1D float array
     # We quantize the feature vector to bytes deterministically
     feat_bytes = feature_vec.astype(np.float32).tobytes()
@@ -177,7 +182,7 @@ def svd_modify_and_reconstruct(A, Wbits, alpha=0.01):
 def get_sift_keypoints(rgb_img, max_kp=64):
     # expects uint8 RGB
     gray = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY)
-    sift = cv2.SIFT_create()
+    sift = cv2.SIFT_create(nfeatures=max_kp*2)
     kps = sift.detect(gray, None)
     kps = sorted(kps, key=lambda x: -x.response)[:max_kp]
     return kps
@@ -220,7 +225,7 @@ def extract_patch(img, kp, patch_size=64):
 # %%
 # Embedding routine across N SIFT patches
 
-def embed_digest_in_image(rgb_img, digest_bits, N_patches=8, patch_size=64, alpha=0.02, key=b'secret'):
+def embed_digest_in_image(rgb_img, digest_bits, N_patches=DEFAULT_MIN_PATCHES, patch_size=DEFAULT_PATCH_SIZE, alpha=0.02, key=b'secret'):
     # rgb_img: uint8 RGB
     kp_list = get_sift_keypoints(rgb_img, max_kp=N_patches*4)
     chosen = kp_list[:N_patches]
@@ -276,7 +281,7 @@ def embed_digest_in_image(rgb_img, digest_bits, N_patches=8, patch_size=64, alph
 # %%
 # Extraction routine from patches
 
-def extract_digest_from_image(rgb_img, N_patches=8, patch_size=64, bits_per_patch=16, alpha=0.02):
+def extract_digest_from_image(rgb_img, N_patches=DEFAULT_MIN_PATCHES, patch_size=DEFAULT_PATCH_SIZE, bits_per_patch=16, alpha=0.02):
     kp_list = get_sift_keypoints(rgb_img, max_kp=N_patches*4)
     chosen = kp_list[:N_patches]
     extracted_bits = []
@@ -370,7 +375,7 @@ def hamming_distance(s1, s2):
     return sum(c1!=c2 for c1,c2 in zip(s1,s2))
 
 
-def verify_semi_fragile(received_rgb, original_rgb, key=b'secret_key', N_patches=8, digest_bits=128, bits_per_patch=16, T_accept=12, T_reject=30):
+def verify_semi_fragile(received_rgb, original_rgb, key=b'secret_key', N_patches=DEFAULT_MIN_PATCHES, digest_bits=DEFAULT_DIGEST_BITS, bits_per_patch=16, T_accept=12, T_reject=30):
     # recompute digest from received (for semi-fragile we want to recompute from received image features)
     # but using original features would be used for owner-side. Here we simulate both.
     # For user's verification: owner stores digest(original) and compares
@@ -414,11 +419,11 @@ donor_uint8 = (donor*255).astype(np.uint8)
 
 # compute feature and digest
 feat = extract_vgg_descriptor(img_uint8)
-digest = compute_hmac_digest(feat, key=b'my_secret_key', digest_bits=128)
+digest = compute_hmac_digest(feat, key=b'my_secret_key', digest_bits=DEFAULT_DIGEST_BITS)
 print('Digest bits length:', len(digest))
 
 # embed
-watermarked, locs, bits_per_patch = embed_digest_in_image(img_uint8, digest, N_patches=8, patch_size=64, alpha=0.02)
+watermarked, locs, bits_per_patch = embed_digest_in_image(img_uint8, digest, N_patches=DEFAULT_MIN_PATCHES, patch_size=DEFAULT_PATCH_SIZE, alpha=0.02)
 
 # attack benign
 attacked_benign = compound_benign(watermarked)
@@ -426,8 +431,8 @@ attacked_benign = compound_benign(watermarked)
 attacked_malicious = malicious_splice(watermarked, donor_uint8)
 
 # verify
-res_benign = verify_semi_fragile(attacked_benign, img_uint8, key=b'my_secret_key', bits_per_patch=bits_per_patch)
-res_mal = verify_semi_fragile(attacked_malicious, img_uint8, key=b'my_secret_key', bits_per_patch=bits_per_patch)
+res_benign = verify_semi_fragile(attacked_benign, img_uint8, key=b'my_secret_key', N_patches=len(locs), bits_per_patch=bits_per_patch)
+res_mal = verify_semi_fragile(attacked_malicious, img_uint8, key=b'my_secret_key', N_patches=len(locs), bits_per_patch=bits_per_patch)
 print('Benign result:', res_benign[0], 'hamming to orig,rec:', res_benign[1], res_benign[2])
 print('Malicious result:', res_mal[0], 'hamming to orig,rec:', res_mal[1], res_mal[2])
 
@@ -445,7 +450,7 @@ def evaluate_on_dataset(images, donor_images, key=b'my_secret_key'):
     for i,img in enumerate(images):
         img_uint8 = (img*255).astype(np.uint8)
         feat = extract_vgg_descriptor(img_uint8)
-        digest = compute_hmac_digest(feat, key=key, digest_bits=128)
+        digest = compute_hmac_digest(feat, key=key, digest_bits=DEFAULT_DIGEST_BITS)
         watermarked, locs, bits_per_patch, enc_bits, nsym_used = embed_digest_with_rs(img_uint8, digest, nsym=32)
         # benign
         attacked = compound_benign(watermarked)
@@ -453,7 +458,7 @@ def evaluate_on_dataset(images, donor_images, key=b'my_secret_key'):
             attacked,
             img_uint8,
             key=key,
-            orig_nbits=128,
+            orig_nbits=DEFAULT_DIGEST_BITS,
             nsym=nsym_used,
             N_patches=len(locs),
             bits_per_patch=bits_per_patch,
@@ -469,7 +474,7 @@ def evaluate_on_dataset(images, donor_images, key=b'my_secret_key'):
             mal,
             img_uint8,
             key=key,
-            orig_nbits=128,
+            orig_nbits=DEFAULT_DIGEST_BITS,
             nsym=nsym_used,
             N_patches=len(locs),
             bits_per_patch=bits_per_patch,
@@ -552,7 +557,7 @@ class Encoder(nn.Module):
                                    nn.Conv2d(hidden*2, hidden*2, 3, padding=1), nn.ReLU())
         self.up1 = nn.Sequential(nn.ConvTranspose2d(hidden*2, hidden, 2, stride=2), nn.ReLU())
         self.out_conv = nn.Conv2d(hidden, in_channels, 1)
-    def forward(self, x, payload_bits):
+    def forward(self, x, payload_bits, strength=0.1):
         if payload_bits is None:
             payload_bits = torch.zeros(x.size(0), self.payload_len, device=x.device, dtype=x.dtype)
         payload_feat = self.payload_embed(payload_bits)
@@ -564,7 +569,7 @@ class Encoder(nn.Module):
         u = self.up1(d2)
         # skip connection
         r = u + d1
-        res = torch.tanh(self.out_conv(r)) * 0.1  # small residual scale
+        res = torch.tanh(self.out_conv(r)) * strength
         return res
 
 class Decoder(nn.Module):
@@ -583,65 +588,99 @@ class Decoder(nn.Module):
 class DifferentiableAttack(nn.Module):
     def __init__(self, p_jpeg=0.5):
         super().__init__()
-        self.p_jpeg = p_jpeg
+        self.base_probs = {
+            'resize': 0.2,
+            'rotate': 0.15,
+            'blur': 0.25,
+            'noise': 0.3,
+            'jpeg': p_jpeg
+        }
+        self.max_probs = {
+            'resize': 0.9,
+            'rotate': 0.7,
+            'blur': 0.8,
+            'noise': 0.95,
+            'jpeg': max(0.85, p_jpeg)
+        }
+        self.min_noise = 0.002
+        self.max_noise = 0.012
+        self.min_scale = 0.85
+        self.max_scale = 0.65  # effective lower bound when progress -> 1 (scale in [max_scale,1])
+        self.max_rotation = 5.0
+        self.update_schedule(0.0)
+
+    def update_schedule(self, progress: float):
+        progress = float(np.clip(progress, 0.0, 1.0))
+        self.resize_prob = self.base_probs['resize'] + (self.max_probs['resize'] - self.base_probs['resize']) * progress
+        self.rotate_prob = self.base_probs['rotate'] + (self.max_probs['rotate'] - self.base_probs['rotate']) * progress
+        self.blur_prob = self.base_probs['blur'] + (self.max_probs['blur'] - self.base_probs['blur']) * progress
+        self.noise_prob = self.base_probs['noise'] + (self.max_probs['noise'] - self.base_probs['noise']) * progress
+        self.jpeg_prob = self.base_probs['jpeg'] + (self.max_probs['jpeg'] - self.base_probs['jpeg']) * progress
+        self.current_noise = self.min_noise + (self.max_noise - self.min_noise) * progress
+        self.current_scale_low = self.max_scale + (self.min_scale - self.max_scale) * (1.0 - progress)
+        self.current_rotation = self.max_rotation + 10.0 * progress
+        self.current_blur_kernel = [1, 3, 5, 7] if progress > 0.5 else [1, 3, 5]
+        self.current_jpeg_low = int(90 - 40 * progress)
+
     def forward(self, imgs):
         # imgs: [B,3,H,W] in [0,1]
         x = imgs
+        B, _, H, W = x.shape
         # random resize + rescale
-        if random.random() < 0.9:
-            scales = torch.empty(x.size(0)).uniform_(0.8,1.0).tolist()
+        if random.random() < self.resize_prob:
+            scales = torch.empty(B).uniform_(self.current_scale_low, 1.0).tolist()
             out = torch.zeros_like(x)
-            for i,s in enumerate(scales):
-                h,w = x.shape[2], x.shape[3]
-                nh, nw = max(1,int(h*s)), max(1,int(w*s))
-                small = F.interpolate(x[i:i+1], size=(nh,nw), mode='bilinear', align_corners=False)
-                back = F.interpolate(small, size=(h,w), mode='bilinear', align_corners=False)
+            for i, s in enumerate(scales):
+                nh, nw = max(1, int(H * s)), max(1, int(W * s))
+                small = F.interpolate(x[i:i+1], size=(nh, nw), mode='bilinear', align_corners=False)
+                back = F.interpolate(small, size=(H, W), mode='bilinear', align_corners=False)
                 out[i:i+1] = back
             x = out
         # random rotation small
-        if random.random() < 0.5:
-            angles = torch.empty(x.size(0)).uniform_(-10,10).tolist()
-            grid_list = []
+        if random.random() < self.rotate_prob:
+            angles = torch.empty(B).uniform_(-self.current_rotation, self.current_rotation).tolist()
             theta_batch = []
             for ang in angles:
-                theta = torch.tensor([[np.cos(np.deg2rad(ang)), -np.sin(np.deg2rad(ang)), 0.0],
-                                       [np.sin(np.deg2rad(ang)),  np.cos(np.deg2rad(ang)), 0.0]], dtype=torch.float)
+                cos_a = np.cos(np.deg2rad(ang))
+                sin_a = np.sin(np.deg2rad(ang))
+                theta = torch.tensor([[cos_a, -sin_a, 0.0],
+                                      [sin_a,  cos_a, 0.0]], dtype=torch.float)
                 theta_batch.append(theta.unsqueeze(0))
             theta_batch = torch.cat(theta_batch, dim=0).to(x.device)
             grid = F.affine_grid(theta_batch, x.size(), align_corners=False)
             x = F.grid_sample(x, grid, padding_mode='border', align_corners=False)
         # gaussian blur approximated by depthwise conv
-        if random.random() < 0.7:
-            k = random.choice([1,3,5])
-            if k>1:
+        if random.random() < self.blur_prob:
+            k = random.choice(self.current_blur_kernel)
+            if k > 1:
                 kernel = torch.tensor(cv2.getGaussianKernel(k, k/3).astype(np.float32))
                 kernel2 = kernel @ kernel.T
                 kernel2 = kernel2 / kernel2.sum()
                 k_t = kernel2.unsqueeze(0).unsqueeze(0).to(x.device)
-                pad = k//2
-                out = F.pad(x, (pad,pad,pad,pad), mode='reflect')
-                # conv per channel
+                pad = k // 2
+                out = F.pad(x, (pad, pad, pad, pad), mode='reflect')
                 out_c = []
                 for c in range(3):
-                    kc = k_t
-                    out_c.append(F.conv2d(out[:,c:c+1,:,:], kc, padding=0))
+                    out_c.append(F.conv2d(out[:, c:c+1, :, :], k_t, padding=0))
                 x = torch.cat(out_c, dim=1)
         # additive noise
-        if random.random() < 0.9:
-            noise = torch.randn_like(x) * 0.005
+        if random.random() < self.noise_prob:
+            noise = torch.randn_like(x) * self.current_noise
             x = torch.clamp(x + noise, 0, 1)
-        # non-diff JPEG: apply with probability p_jpeg using PIL round-trip on CPU
-        if random.random() < self.p_jpeg:
-            x_cpu = (x.detach().cpu().clamp(0,1).permute(0,2,3,1).numpy()*255).astype(np.uint8)
+        # non-diff JPEG: apply with probability using PIL round-trip on CPU
+        if random.random() < self.jpeg_prob:
+            x_cpu = (x.detach().cpu().clamp(0, 1).permute(0, 2, 3, 1).numpy() * 255).astype(np.uint8)
             out_cpu = []
+            q_low = max(30, self.current_jpeg_low)
+            q_high = 95
             for i in range(x_cpu.shape[0]):
                 bgr = cv2.cvtColor(x_cpu[i], cv2.COLOR_RGB2BGR)
-                q = random.randint(60,95)
+                q = random.randint(q_low, q_high)
                 _, enc = cv2.imencode('.jpg', bgr, [int(cv2.IMWRITE_JPEG_QUALITY), q])
                 dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
                 dec_rgb = cv2.cvtColor(dec, cv2.COLOR_BGR2RGB)
-                out_cpu.append(dec_rgb.astype(np.float32)/255.0)
-            x = torch.from_numpy(np.stack(out_cpu, axis=0)).permute(0,3,1,2).to(x.device)
+                out_cpu.append(dec_rgb.astype(np.float32) / 255.0)
+            x = torch.from_numpy(np.stack(out_cpu, axis=0)).permute(0, 3, 1, 2).to(x.device)
         return x
 
 # %%
@@ -677,6 +716,7 @@ def train_residual_encoder(root_images='./images_train', epochs=10, batch_size=8
 
     for epoch in range(epochs):
         enc.train(); dec.train()
+        attack.update_schedule(epoch / max(1, epochs - 1))
         epoch_loss = 0.0
         start = time.time()
         for imgs in loader:
@@ -684,7 +724,9 @@ def train_residual_encoder(root_images='./images_train', epochs=10, batch_size=8
             B = imgs.size(0)
             # random payload per image
             payload = torch.randint(0,2,(B,payload_len), device=device).float()
-            residual = enc(imgs, payload)
+            progress = epoch / max(1, epochs - 1)
+            residual_strength = 0.18 - 0.08 * progress
+            residual = enc(imgs, payload, strength=residual_strength)
             watermarked = torch.clamp(imgs + residual, 0.0, 1.0)
             # Attack
             attacked = attack(watermarked)
@@ -694,7 +736,10 @@ def train_residual_encoder(root_images='./images_train', epochs=10, batch_size=8
             mse = F.mse_loss(watermarked, imgs)
             perc = perceptual_loss(watermarked, imgs)
             loss = bce + 0.1*mse + 0.5*perc
-            optim.zero_grad(); loss.backward(); optim.step()
+            optim.zero_grad()
+            loss.backward()
+            nn_utils.clip_grad_norm_(list(enc.parameters()) + list(dec.parameters()), max_norm=5.0)
+            optim.step()
             epoch_loss += loss.item()
         dur = time.time() - start
         print(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss/len(loader):.4f} - time: {dur:.1f}s")
@@ -779,14 +824,14 @@ def rs_decode_bits(encoded_bitstr: str, orig_nbits: int, nsym: int=32):
 # %%
 # Update embedding routine to accept ECC encoded digest
 
-def embed_digest_with_rs(rgb_img, digest_bits, nsym=32, patch_size=64, min_patches=8, **kwargs):
+def embed_digest_with_rs(rgb_img, digest_bits, nsym=32, patch_size=DEFAULT_PATCH_SIZE, min_patches=DEFAULT_MIN_PATCHES, **kwargs):
     current_nsym = nsym
     last_error = None
     while current_nsym >= 1:
         enc_bits = rs_encode_bits(digest_bits, nsym=current_nsym)
         max_bits_per_patch = max(1, patch_size // 2)
         required_patches = math.ceil(len(enc_bits) / max_bits_per_patch)
-        desired_patches = max(min_patches, required_patches)
+        desired_patches = max(min_patches, required_patches + 4)
         kwargs_local = dict(kwargs)
         N_patches = max(kwargs_local.pop('N_patches', desired_patches), desired_patches)
         try:
@@ -802,6 +847,7 @@ def embed_digest_with_rs(rgb_img, digest_bits, nsym=32, patch_size=64, min_patch
             last_error = e
             if current_nsym <= 4:
                 break
+            min_patches = max(min_patches + 4, desired_patches + 2)
             reduced_nsym = max(4, current_nsym // 2)
             warnings.warn(
                 f"Embedding capacity limited; reducing Reed-Solomon parity bytes from {current_nsym} to {reduced_nsym}.",
@@ -813,7 +859,7 @@ def embed_digest_with_rs(rgb_img, digest_bits, nsym=32, patch_size=64, min_patch
 # %%
 # Per-patch extraction that returns confidence as well
 
-def extract_digest_with_confidence(rgb_img, N_patches=8, patch_size=64, bits_per_patch=16, alpha=0.02):
+def extract_digest_with_confidence(rgb_img, N_patches=DEFAULT_MIN_PATCHES, patch_size=DEFAULT_PATCH_SIZE, bits_per_patch=16, alpha=0.02):
     kp_list = get_sift_keypoints(rgb_img, max_kp=N_patches*4)
     chosen = kp_list[:N_patches]
     extracted_bits = []
@@ -869,8 +915,8 @@ def weighted_majority_aggregate(extracted_bits_list, confidences, expected_len=N
 # %%
 # RS-aware extraction wrapper: aggregate patches -> RS decode -> return decoded bits and status
 
-def extract_and_decode_rs(rgb_img, orig_nbits=128, N_patches=8, bits_per_patch=16, nsym=32, encoded_bits_len=None):
-    extracted_list, confs, boxes = extract_digest_with_confidence(rgb_img, N_patches=N_patches, patch_size=64, bits_per_patch=bits_per_patch)
+def extract_and_decode_rs(rgb_img, orig_nbits=DEFAULT_DIGEST_BITS, N_patches=DEFAULT_MIN_PATCHES, bits_per_patch=16, nsym=32, encoded_bits_len=None):
+    extracted_list, confs, boxes = extract_digest_with_confidence(rgb_img, N_patches=N_patches, patch_size=DEFAULT_PATCH_SIZE, bits_per_patch=bits_per_patch)
     expected_len = encoded_bits_len if encoded_bits_len is not None else orig_nbits + nsym*8
     agg_bits, avg_conf = weighted_majority_aggregate(extracted_list, confs, expected_len=expected_len)
     trimmed_bits = agg_bits[:expected_len]
@@ -926,7 +972,7 @@ def fuse_decisions(fr_result, fr_conf, robust_ok, robust_conf, thresholds=dict(p
 # Example combined verification function using the new ECC + voting + fusion
 
 def combined_verification_pipeline(received_rgb, original_rgb, key=b'my_secret_key',
-                                   orig_nbits=128, nsym=32, N_patches=8, bits_per_patch=16,
+                                   orig_nbits=DEFAULT_DIGEST_BITS, nsym=32, N_patches=DEFAULT_MIN_PATCHES, bits_per_patch=16,
                                    encoded_bits_len=None):
     # Semi-fragile (fragile) path: extract + RS decode
     decoded, ok, info, avg_conf, patch_boxes, patch_confidences = extract_and_decode_rs(received_rgb, orig_nbits=orig_nbits, N_patches=N_patches, bits_per_patch=bits_per_patch, nsym=nsym, encoded_bits_len=encoded_bits_len)
@@ -1092,7 +1138,7 @@ class SubsetImageDataset(Dataset):
 # %%
 # Hybrid model: encoder produces residual; final watermarked image also runs classical embedding per-batch optionally
 class HybridSystem:
-    def __init__(self, enc, dec, use_classical_embed=True, digest_bits=128, key=b'my_secret_key', nsym=32):
+    def __init__(self, enc, dec, use_classical_embed=True, digest_bits=DEFAULT_DIGEST_BITS, key=b'my_secret_key', nsym=32):
         self.enc = enc
         self.dec = dec
         self.use_classical = use_classical_embed
@@ -1107,13 +1153,14 @@ class HybridSystem:
         for img_np in imgs_np_batch:
             feat = extract_vgg_descriptor(img_np)
             digest = compute_hmac_digest(feat, key=self.key, digest_bits=self.digest_bits)
+            min_patch_target = DEFAULT_MIN_PATCHES
             try:
                 wm, locations, bits_per_patch, enc_bits, nsym_used = embed_digest_with_rs(
                     img_np,
                     digest_bits=digest,
                     nsym=self.nsym,
-                    patch_size=64,
-                    min_patches=8
+                    patch_size=DEFAULT_PATCH_SIZE,
+                    min_patches=DEFAULT_MIN_PATCHES
                 )
                 metadata.append({
                     'digest': digest,
@@ -1128,17 +1175,37 @@ class HybridSystem:
                 out_list.append(wm)
             except ValueError as e:
                 warnings.warn(f"Classical embedding fallback due to: {e}", RuntimeWarning)
-                metadata.append({
-                    'digest': digest,
-                    'encoded_bits': '',
-                    'encoded_len_bits': 0,
-                    'bits_per_patch': 0,
-                    'locations': [],
-                    'N_patches': 0,
-                    'nsym_used': 0,
-                    'fallback': True
-                })
-                out_list.append(img_np)
+                try:
+                    plain_wm, plain_locs, plain_bits = embed_digest_in_image(
+                        img_np,
+                        digest,
+                        N_patches=max(DEFAULT_MIN_PATCHES, min_patch_target + 4),
+                        patch_size=DEFAULT_PATCH_SIZE,
+                        alpha=0.02
+                    )
+                    metadata.append({
+                        'digest': digest,
+                        'encoded_bits': digest,
+                        'encoded_len_bits': len(digest),
+                        'bits_per_patch': plain_bits,
+                        'locations': plain_locs,
+                        'N_patches': len(plain_locs),
+                        'nsym_used': 0,
+                        'fallback': True
+                    })
+                    out_list.append(plain_wm)
+                except Exception:
+                    metadata.append({
+                        'digest': digest,
+                        'encoded_bits': '',
+                        'encoded_len_bits': 0,
+                        'bits_per_patch': 0,
+                        'locations': [],
+                        'N_patches': 0,
+                        'nsym_used': 0,
+                        'fallback': True
+                    })
+                    out_list.append(img_np)
         self.last_metadata = metadata
         wm_array = np.stack(out_list, axis=0)
         if return_metadata:
@@ -1180,6 +1247,9 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
         running_loss = 0.0
         running_steps = 0
         t0 = time.time()
+        epoch_progress = epoch / max(1, epochs - 1)
+        attack.update_schedule(epoch_progress)
+        residual_strength = 0.18 - 0.08 * epoch_progress
         for i, imgs in enumerate(train_loader):
             imgs = imgs.to(device)
             B = imgs.size(0)
@@ -1190,7 +1260,7 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
 
             # Learned residual on top conditioned on payload
             payload = torch.randint(0,2,(B,payload_len), device=device).float()
-            residual = enc(classical_wm_t, payload)
+            residual = enc(classical_wm_t, payload, strength=residual_strength)
             watermarked = torch.clamp(classical_wm_t + residual, 0.0, 1.0)
 
             attacked = attack(watermarked)
@@ -1200,7 +1270,10 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
             perc = perceptual_loss(watermarked, classical_wm_t)
             loss = bce + 0.05*mse + 0.3*perc
 
-            optim.zero_grad(); loss.backward(); optim.step()
+            optim.zero_grad()
+            loss.backward()
+            nn_utils.clip_grad_norm_(params, max_norm=5.0)
+            optim.step()
             running_loss += loss.item(); running_steps += 1
 
             if (i+1) % 20 == 0:
@@ -1215,6 +1288,7 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
 
         # Validation
         enc.eval(); dec.eval()
+        attack.update_schedule(min(1.0, (epoch + 0.3)/max(1, epochs - 1)))
         val_losses = []
         all_preds = []
         all_targets = []
@@ -1226,7 +1300,7 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
                 classical_wm_np = hybrid.embed_classical_batch(imgs_np)
                 classical_wm_t = torch.from_numpy(classical_wm_np.astype(np.float32)/255.0).permute(0,3,1,2).to(device)
                 payload = torch.randint(0,2,(B,payload_len), device=device).float()
-                residual = enc(classical_wm_t, payload)
+                residual = enc(classical_wm_t, payload, strength=0.12)
                 watermarked = torch.clamp(classical_wm_t + residual, 0.0, 1.0)
                 attacked = attack(watermarked)
                 logits = dec(attacked)
@@ -1293,6 +1367,8 @@ def train_and_evaluate(root_images, gpu_device='cuda', epochs=6, batch_size=16, 
 
 def evaluate_test_suite(test_loader, hybrid, enc, dec, attack_model, device, payload_len=64):
     enc.eval(); dec.eval()
+    if hasattr(attack_model, 'update_schedule'):
+        attack_model.update_schedule(1.0)
     attacks = {
         'benign': lambda x: compound_benign(x),
         'jpeg_q50': lambda x: attack_jpeg(x, quality=50),
